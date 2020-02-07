@@ -1,0 +1,406 @@
+---
+title: "Final Data Analysis Project"
+date:  "See Parts for Write-Up due Dates"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if(!require(DataExplorer)){
+  install.packages('DataExplorer') 
+  library(DataExplorer)
+}
+if(!require(janitor)){
+  install.packages('janitor') 
+  library(janitor)
+}
+library(car)
+library(ggplot2)
+library(tidyverse)
+library(GGally)
+library(knitr)
+#library(mice)
+knitr::opts_chunk$set(echo = FALSE,error = TRUE, warning = FALSE)
+```
+
+```{r read-data, echo=FALSE} 
+load("paintings_train.Rdata")
+load("paintings_test.Rdata")
+```
+
+```{r cleaning, echo=FALSE, fig.height=10}
+clean_general <- function(paintings_train){
+  index <- sapply(paintings_train,typeof) == "character"
+  factor_names <- names(index)[index]
+  numeric_names <- names(index)[!index]
+  paintings_train[paintings_train == "" | paintings_train == "n/a" | paintings_train == "Unknown" | paintings_train == "NA"] <- NA
+  paintings_train[factor_names] <- lapply(paintings_train[factor_names],factor)
+
+  years_df <- paintings_train %>% 
+    group_by(year) %>% 
+    summarise(avg_logprice=mean(logprice))
+  
+  # clean year
+  for (i in unique(paintings_train$year)){
+    paintings_train[,paste0("is_",i)]=ifelse(paintings_train$year==i,1,0)
+  }
+  
+  # clean shape
+  paintings_train <- paintings_train %>% 
+    mutate(squ_rect_oval = ifelse(grepl("squ_rect", Shape)|grepl("oval", Shape), 1, 0),
+           round = ifelse(grepl("ro", Shape), 1, 0))
+  
+  # clean material
+  paintings_train <- paintings_train %>%
+    mutate(is_bronze = ifelse(grepl("bronze", material), 1, 0),
+           is_wood = ifelse(grepl("bois", material), 1, 0),
+           is_canvas = ifelse(grepl("toile", material), 1, 0),
+           is_copper = ifelse(grepl("cuivre", material), 1, 0),
+           is_glass = ifelse(grepl("verre", material), 1, 0),
+           is_oil = ifelse(grepl("huile", material), 1, 0),
+           is_paper = ifelse(grepl("papier", material), 1, 0),
+           is_pastel = ifelse(grepl("pastel", material), 1, 0),
+           is_cardboard = ifelse(grepl("carton", material), 1, 0),
+           is_board = ifelse(grepl("tableau", material), 1, 0))
+}
+
+clean_author <- function(paintings_train){
+  # clean author
+  paintings_train <- paintings_train %>% 
+    mutate(is_copy = ifelse(is.na(paintings_train$authorstyle),0,1))
+  
+  author_style_df <- paintings_train %>%
+    mutate(price = exp(logprice)) %>%
+    group_by(authorstyle) %>%
+    summarize(total_paintings = n(),
+              log_mean_price = log(mean(price))) %>%
+    arrange(desc(total_paintings))
+  
+  temp1 <- paintings_train %>%
+    mutate(authorstandard2 = 
+             trimws(str_replace_all(authorstandard, 
+                             paste(author_style_df$authorstyle[author_style_df$authorstyle != "n/a"], collapse="|"), "")))
+  
+  author_standard2_df <- temp1 %>%
+    mutate(price = exp(logprice)) %>%
+    group_by(authorstandard2) %>%
+    summarize(total_paintings = n(),
+              log_mean_price = log(mean(price))) %>%
+    arrange(desc(total_paintings))
+  
+  ind_authors <- author_standard2_df %>%
+    separate(authorstandard2, c("Author_1", "Author_2"), sep=";") %>%
+    gather(key="Author_num", value="Author", -total_paintings, -log_mean_price) %>%
+    select(-Author_num) %>%
+    filter(!is.na(Author)) %>%
+    mutate(Author = trimws(Author)) %>%
+    group_by(Author) %>%
+    summarize(log_mean_price = log(sum(total_paintings*exp(log_mean_price))/sum(total_paintings)),
+              total_paintings = sum(total_paintings)) %>%
+    arrange(desc(total_paintings)) %>%
+    filter(total_paintings >= 10)
+  
+  paintings_train2 <- paintings_train %>%
+    mutate(authorstandard2 = 
+             trimws(str_replace_all(authorstandard, 
+                             paste(author_style_df$authorstyle[author_style_df$authorstyle != "n/a"],
+                                   collapse="|"), ""))) %>%
+    separate(authorstandard2, c("Author_1", "Author_2"), sep=";") %>%
+    mutate(Author_1 = trimws(Author_1),
+           Author_2 = trimws(Author_2))
+    
+  return(list(ind_authors= ind_authors,
+              paintings_train2 = paintings_train2))
+}
+
+clean <- function(df){
+  train <- clean_general(paintings_train)
+  df2 <- clean_general(df)
+  train2 <- clean_author(train)
+  ind_authors = train2$ind_authors
+  df2 <- clean_author(df2)$paintings_train2
+  
+  for(i in as.character(ind_authors$Author)){
+    df2[,paste0("is_",i)]=
+      ifelse(grepl(i, df2$Author_1, fixed=TRUE) | grepl(i,df2$Author_2, fixed=TRUE),1,0)
+  }
+  
+  df2 <- clean_names(df2)
+}
+paintings_train2 <- clean(paintings_train)
+
+plot_missing(paintings_train2)
+summary(paintings_train2)
+
+
+
+# take out variables by looking the data description and summary
+# The following variables are taken out for at least one of the following reasons:
+# 1. redundant
+# 2. the variable has too many missing values
+# 3. not useful
+# 4. the variables are broken down into binary variables(year,authorstandard,material,Shape)
+train <- paintings_train2 %>% 
+  select(-c(sale,lot,price,count,authorstyle,winningbidder,subject,
+            other,origin_author,school_pntg,diff_origin,author,
+            winningbiddertype,type_intermed,surface_rect,surface_rnd,
+            height_in,width_in,diam_in,material_cat,mat,nfigures,
+            lands_all,lands_ment,lands_elem,year,authorstandard,material,shape)) %>% 
+  clean_names()
+```
+
+```{r eda scatterplot, echo=FALSE, eval=FALSE}
+names.quant <- c("logprice","position","surface")
+df_quant <- train[names.quant] %>% 
+  gather(key = "quant_variable",value = "quant_value",position:surface)
+
+ggplot(df_quant,aes(x= quant_value,y= logprice)) +
+  geom_point()+
+  facet_wrap(~quant_variable,scales = "free") +
+  theme_bw() +
+  labs(x = "", title = "logprice vs Quantitative Predictors Scatterplots") +
+  stat_smooth(method="lm")
+```
+
+```{r eda boxplot1, echo=FALSE, fig.height=10, eval=FALSE}
+df_qual <- train %>% 
+  select(-names.quant,logprice) %>% 
+  gather(key = "qual_variable",value = "qual_value",dealer:is_board)
+
+ggplot(df_qual,aes(x= factor(qual_value),y= logprice))+
+  geom_boxplot()+
+  facet_wrap(~qual_variable,scales = "free",ncol=6) +
+  theme_bw() +
+  labs(x = "", title = "logprice vs Qualitative Predictors Boxplots")
+```
+
+```{r eda boxplot2, echo=FALSE, fig.height=10, eval=FALSE}
+df_qual2 <- train %>% 
+  select(-names.quant,logprice) %>% 
+  gather(key = "qual_variable",value = "qual_value",is_teniers_ii_the_younger_david:is_potter_pa_paulus)
+
+ggplot(df_qual2,aes(x= factor(qual_value),y= logprice))+
+  geom_boxplot()+
+  facet_wrap(~qual_variable,scales = "free",ncol=6) +
+  theme_bw() +
+  labs(x = "", title = "logprice vs Qualitative Predictors Boxplots")
+```
+
+```{r avplot, echo=FALSE, fig.height=4, eval=FALSE}
+reg_cols <- c(colnames(train)[grepl("is_", colnames(train))])
+nonis_cols <- names(train %>% select(position:pastorale,-logprice))
+formula <- as.formula(paste0("logprice ~ ", paste(paste0(nonis_cols), collapse="+")))
+avPlots(lm(formula, data=train))
+
+is_cols <- names(train %>% select(is_1778:is_potter_pa_paulus,-author_1,-author_2))
+formula2 <- as.formula(paste0("logprice ~ ", paste(paste0(is_cols), collapse="+")))
+avPlots(lm(formula2, data=train))
+
+temporary <- avPlots(lm(formula, data=train))
+slope_nonis <- sapply(temporary,function(x){
+  lm(x[,2]~x[,1])$coef[2]
+})
+
+temporary2 <- avPlots(lm(formula2, data=train))
+slope_is <- sapply(temporary2,function(x){
+  lm(x[,2]~x[,1])$coef[2]
+})
+
+sort(abs(slope_nonis),decreasing = TRUE)
+sort(abs(slope_is),decreasing = TRUE)
+```
+Potential variables to include:
+non-is's: dealer,origin_cat,prevcoll,lrgfont,interm,endbuyer,finished,artistliving,surface   
+is's: year(factor),is_oil,is_copy,is_paper    
+authors:is_crepin, is_french, is_velde_a_adriaen_van_de, is_wouwerman_philips, is_anonymous     
+
+### first model (lm without interaction)
+
+```{r model1, echo=FALSE}
+model1 = lm(logprice ~ dealer+origin_cat+prevcoll+lrgfont+interm+endbuyer+
+              finished+artistliving+surface+year+is_oil+is_copy+is_paper+
+              is_crepin+is_french+is_velde_a_adriaen_van_de+
+              is_wouwerman_philips+is_anonymous,
+            data=paintings_train2)
+summary(model1)
+par(mfrow=c(2,2))
+plot(model1)
+
+# observations 283 and 315 have leverage one
+```
+
+```{r, echo=FALSE, message=FALSE}
+model1_conf = data.frame(names(model1$coefficients), model1$coefficients, confint(model1))
+colnames(model1_conf) = c("Coefficient", "Estimate", "2.5%", "97.5%")
+model1_conf <- model1_conf %>% 
+  arrange(desc(Estimate))
+
+kable(model1_conf, digits = 4,
+      caption = "Confidence interval of coefficients from full model")
+```
+
+### improved first model (lm with interaction)
+
+```{r, echo=FALSE}
+model1_inter = lm(logprice ~ (dealer+origin_cat+prevcoll+lrgfont+interm+endbuyer+
+              finished+artistliving+year+is_oil+is_copy+is_paper +surface+
+              is_crepin+is_french+is_velde_a_adriaen_van_de+
+              is_wouwerman_philips+is_anonymous)^2, data = paintings_train2)
+summary(model1_inter)
+```
+
+significant interactions: (get from summary) dealer:interm, dealer:finished, dealer:artistliving,  dealer:year, origin_cat:year, origin_cat:is_copy
+
+```{r, echo=FALSE}
+model1_modified = lm(logprice ~ dealer+origin_cat+prevcoll+lrgfont+interm+endbuyer+
+              finished+artistliving+surface+year+is_oil+is_copy+is_paper+
+              is_crepin+is_french+is_velde_a_adriaen_van_de+
+              is_wouwerman_philips+is_anonymous + dealer:interm + dealer:finished+
+                dealer:artistliving+  dealer:year+ origin_cat:year+ origin_cat:is_copy,
+              data = paintings_train2)
+as.formula(model1_modified)
+```
+
+### selection (AIC)
+
+```{r model1 aic, echo=FALSE}
+model1.aic <- step(model1_modified, k = 2, trace = FALSE)
+```
+
+```{r, echo=FALSE}
+summary(model1.aic)
+par(mfrow=c(2,2))
+plot(model1.aic)
+```
+
+```{r, echo=FALSE}
+aic_conf <- data.frame(var = names(model1.aic$coefficients), coef = model1.aic$coefficients,
+                  lwr = confint(model1.aic)[,1], upr = confint(model1.aic)[,2],
+                  row.names = NULL)
+kable(aic_conf, digits = 3, caption = "Coefs and C.I. of the best AIC model")
+```
+
+### selection (BIC)
+
+```{r model1 bic, echo=FALSE}
+model1.bic <- step(model1_modified, k = log(nrow(paintings_train2)), trace = FALSE)
+```
+
+```{r, echo=FALSE}
+summary(model1.bic)
+par(mfrow=c(2,2))
+plot(model1.bic)
+```
+
+```{r, echo=FALSE}
+bic_conf <- data.frame(var = names(model1.bic$coefficients), coef = model1.bic$coefficients,
+                  lwr = confint(model1.bic)[,1], upr = confint(model1.bic)[,2],
+                  row.names = NULL)
+kable(bic_conf, digits = 3, caption = "Coefs and C.I. of the best BIC model")
+```
+
+### save predictions and intervals  
+### needs modification
+
+```{r predict-model1, echo=FALSE, eval=FALSE}
+
+paintings_test2 <- clean(paintings_test)
+
+predictions = as.data.frame(
+  exp(predict(model1.aic, newdata=paintings_test2, 
+              interval = "pred")))
+save(predictions, file="predict-test.Rdata")
+```
+
+
+
+## echo=FALSE
+## diagnostic plot: to decide transformation
+
+
+
+
+
+
+
+## Part II: Complex Model  (start Dec 4th ideally!)
+
+In this part you may go all out for constructing a best fitting model for predicting housing prices using methods that we have covered this semester.  You should feel free to to create any new variables (such as quadratic, interaction, or indicator variables, splines, etc) and try different methods, keeping in mind you should be able to explain your methods and results.
+
+
+
+
+Variables from part I:
+non-is's: dealer,origin_cat,prevcoll,lrgfont,interm,endbuyer,finished,artistliving,surface   
+is's: year(factor),is_oil,is_copy,is_paper    
+authors:is_crepin, is_french, is_velde_a_adriaen_van_de, is_wouwerman_philips, is_anonymous    
+
+```{r}
+# further eda
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+Update your predictions using your complex model to provide point estimates and CI.
+
+```{r predict-model2, echo=FALSE}
+# replace model1 with model2 here
+predictions = as.data.frame(
+  exp(predict(model1, newdata=paintings_test, 
+              interval = "pred")))
+save(predictions, file="predict-test.Rdata")
+```
+
+You may iterate here as much as you like exploring different models until you are satisfied with your results, however keep in mind you must be able to explain your results to the art historian.
+
+### Part II: Write Up
+
+Once you are satisfied with your model, provide a write up of your data analysis project in a new Rmd file/pdf file: `Part-II-Writeup.Rmd` by copying over salient parts of your R notebook and the previous writeup (you should also save the pdf version) The written assignment consists of five parts:
+
+1. Introduction (1 point if improved from before)
+  add previous intro with any edits
+
+2. Exploratory data analysis (1 point if improved from before): 
+   add previous EDA
+   
+3. Discussion of preliminary model Part I (5 points)
+Discuss performance based on leader board results and suggested refinements.
+
+4.  Development of the final model (20 points)
+
+* Final model: must include a summary table
+
+* Variables: must include an explanation
+
+* Variable selection/shrinkage: must use appropriate method and include an explanation
+
+
+* Residual: must include a residual plot and a discussion
+
+* discussion of how prediction intervals obtained 
+
+5. Assessment of the final model (25 points)
+
+
+* Model evaluation: must include an evaluation discussion
+
+* Model testing : must include a discussion
+
+* Model result: must include a selection and discussion of the top 10 valued  paintings in the validation data.
+
+6. Conclusion (10 points): must include a summary of results and a discussion of things learned. Optional what would you do if you had more time.
+
+
+
+Finally your repo should have: `Part-I-Writeup.Rmd`, `Part-I-Writeup.pdf`,  `Part-II-Writeup.Rmd`, `Part-II-Writeup.pdf`,`slides.Rmd` (and whatever output you use for the presentation) and `predict-train.Rdata`,  `predict-test.Rdata` `predict-validation.Rdata`.

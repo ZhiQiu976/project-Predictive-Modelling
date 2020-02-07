@@ -1,0 +1,675 @@
+---
+title: "Part 1 Writeup"
+date:  "December 6, 2019"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if(!require(DataExplorer)){
+  install.packages('DataExplorer') 
+  library(DataExplorer)
+}
+if(!require(janitor)){
+  install.packages('janitor') 
+  library(janitor)
+}
+library(car)
+library(ggplot2)
+library(tidyverse)
+library(GGally)
+library(scales)
+library(knitr)
+knitr::opts_chunk$set(echo = FALSE,error = TRUE, warning = FALSE)
+```
+
+### 1. Introduction: Summary of problem and objectives (5 points)
+
+We were hired as statistical consultants by an art historian to explore (1) what drove the prices of 18th century paintings in France, and (2) which paintings may be overvalued or undervalued. They have provided us with auction price data from 1764-1780 on the sales (seller/buyer), painter, and other characteristics of paintings.
+
+In part 1, we perform exploratory data analysis to gain high-level insights into the art data, to help us inform further portions, and run a simple model based on these observations. Our objectives of part 1 include:
+
+1. Subsetting data to only consider variables that are both relevant and not redundant of other explanatory variables. For instance, the data contains the variables `material`, `mat`, `materialCat`. These three variables are all conveying similar information, but expressed differently. Which is most appropriate to include in the model?
+
+2. Transforming key text variables to be standardized and in a form that we can pass into regressions and other predictive modelling algorithms. For instance, if we wanted to include the painter (`authorstandard`) in our model, we first may want to remove stop words in the variable such as ("in the taste of"), and may want to count a collaboration between multiple painters (separated by a semicolon in the data) into each individual painter level, rather than count it into a new level of the variable expressing the collaboration separately from the individual painter levels.
+
+3. Impute values of data when they are missing. For instance, the surface area (`Surface`) does not always exist, so we impute the missing data conditional on variables such as `Shape`, `Height_in`, `Width_in`, and `Diam_in` that may give insight into `Surface`.
+
+4. Examining what sources of variation are associated with variations in price for 18th century art sold in France. For instance, given a specific painter, do prices vary significantly? Is the variation for paintings within-painter variation, or across-painter variation?
+
+5. When controlling for all other variables in the dataset, what which variables are most important to predicting the log of the price of paintings. For instance, what is the marginal impact in driving price if it is an Adrien van de Velde painting, holding all other variables constant?
+
+6. Based on the EDA, run an initial model, and examine the in-sample residuals and coverage.
+
+### 2. Exploratory data analysis (10 points): must include three correctly labeled graphs and an explanation that highlight the most important features that went into your model building.
+
+```{r read-data, echo=FALSE}
+load("paintings_train.Rdata")
+load("paintings_test.Rdata")
+```
+
+
+#### Part (a) Remove redundancies
+
+
+There are many redundant variables in the data, so for the purposes of illustration, we show below a sample variable selection choice to remove a redundancy. Note that we used a similar process to remove further redundant variables.
+```{r winningbiddertype-endbuyer, echo=FALSE}
+
+kable(table(paintings_train$winningbiddertype, paintings_train$endbuyer, useNA = "ifany"), caption = "Winning Bidder Type vs. End Buyer")
+```
+
+We see that the last digit of `winningbiddertype` always corresponds to the `endbuyer`. We also see, however, that many of the `winningbiddertype` categories are scarcely populated (`EBC`, for instance, only has 1 value in the training data). Therefore, we use `endbuyer`, and exclude `winningbiddertype` after this step.
+
+The following are the variables we excluded (with the variable that conveys similar information in the parentheses) : `origin_author`, `school_pntg`, `diff_origin` (`origin_cat`); `author` (`author_standard`); `winningbiddertype` (`endbuyer`); `type_intermed` (`Interm`); `Surface_Rect`, `Surface_Rnd`, `Height_in`, `Width_in`, `Diam_in` (`Surface`); `materialCat`, `mat` (`material`); `nfigures` (`singlefig`, `figures`); `landsALL` (`lands_*` variables); `lands_ment` (`lands_sc`, `lands_figs`); `lands_elem` (`lands_sc`, `lands_figs`).
+
+#### Part (b) Cleaning text data
+
+For the purposes of illustration, we only go through the cleaning process for the `authorstandard` variable, though a similar process was applied to `material`, `year`, and `Shape`.
+
+Without any cleaning, it is a good idea to see a set of sample values of the text variable. Below is the 10 most common values for the authors, uncleaned:
+
+```{r uncleaned_authors, echo=FALSE}
+
+uncleaned_authors <- paintings_train %>% 
+  group_by(authorstandard) %>% 
+  summarize(total=n()) %>% 
+  arrange(desc(total)) %>% 
+  slice(1:10)
+
+utf8 <- which(Encoding(uncleaned_authors$authorstandard) == "UTF-8")
+
+uncleaned_authors$authorstandard[utf8] <- iconv(uncleaned_authors$authorstandard[utf8], "UTF-8", "UTF-8",sub='') 
+
+kable(uncleaned_authors, caption= "10 most Frequent Authors, Uncleaned")
+```
+
+To start, we noticed that some `authorstyle`s were included in the `authorstandard` description, where an `n/a` value corresponds to an original by the said author, and all other values correspond to derivations of the author's original work:
+
+```{r copy_values, echo=FALSE}
+kable(table(paintings_train$authorstyle), caption="Types of Derivations of Painters' Work", col.names = c("Author Style", "Frequency"))
+
+```
+
+For the latter group, we marked all such rows as a copy (by creating a variable `is_copy`), and removed these keywords from the author. Additionally, there are some instances where multiple authors contributed to a painting. As a result, we created a binary variable for each other who contributed to at least 10 paintings, where a 1 indicates contribution. Below, observe the sample counts for the most frequent set of authors:
+
+```{r lookup_tables, echo=FALSE}
+impute_surface_area <- function(data){
+  surface1 <-paintings_train %>%
+    mutate(Shape2 = ifelse(Shape %in% c("ronde", "ovale"), 
+                           ifelse(Shape == "ronde", "round", "oval"), Shape)) %>%
+    group_by(Shape2) %>%
+    summarize(Surface = median(Surface, na.rm=TRUE),
+              Surface_is_na = 1,
+              Height_is_na = 1,
+              Width_is_na = 1,
+              Diam_is_na = 1) 
+  
+  surface2 <- paintings_train %>%
+      mutate(Shape2 = ifelse(Shape %in% c("ronde", "ovale"), 
+                             ifelse(Shape == "ronde", "round", "oval"), Shape),
+             Height_in2 = round(Height_in)) %>%
+    group_by(Shape2, Height_in2) %>%
+    summarize(Surface = median(Surface, na.rm=TRUE),
+              Surface_is_na = 1,
+              Height_is_na = 0,
+              Width_is_na = 1,
+              Diam_is_na = 1)
+  
+  surface3 <- paintings_train %>%
+      mutate(Shape2 = ifelse(Shape %in% c("ronde", "ovale"), 
+                             ifelse(Shape == "ronde", "round", "oval"), Shape),
+             Width_in2 = round(Width_in)) %>%
+    group_by(Shape2, Width_in2) %>%
+    summarize(Surface = median(Surface, na.rm=TRUE),
+              Surface_is_na = 1,
+              Height_is_na = 1,
+              Width_is_na = 0,
+              Diam_is_na = 1)
+  
+  surface4 <- paintings_train %>%
+      mutate(Shape2 = ifelse(Shape %in% c("ronde", "ovale"), 
+                             ifelse(Shape == "ronde", "round", "oval"), Shape),
+             Diam_in2 = round(Diam_in)) %>%
+    group_by(Diam_in2) %>%
+    summarize(Surface = median(Surface, na.rm=TRUE),
+              Surface_is_na = 1,
+              Height_is_na = 1,
+              Width_is_na = 1,
+              Diam_is_na = 0)
+  
+  data <- data %>%
+    mutate(Shape2 = ifelse(Shape %in% c("ronde", "ovale"), 
+                           ifelse(Shape == "ronde", "round", "oval"), Shape),
+           Surface_is_na = ifelse(is.na(Surface), 1, 0),
+           Height_is_na = ifelse(is.na(Height_in), 1, 0),
+           Width_is_na = ifelse(is.na(Width_in), 1, 0),
+           Diam_is_na = ifelse(is.na(Diam_in), 1, 0),
+           Height_in2 = round(Height_in),
+           Width_in2 = round(Width_in),
+           Diam_in2 = round(Diam_in)) %>%
+    left_join(surface1, by = c("Shape2", "Surface_is_na", "Height_is_na",
+                               "Width_is_na", "Diam_is_na"), 
+              suffix = c("", "1")) %>%
+    left_join(surface2, by = c("Shape2", "Surface_is_na", "Height_is_na",
+                               "Width_is_na", "Diam_is_na", "Height_in2"), 
+              suffix = c("", "2")) %>%
+    left_join(surface3, by = c("Shape2", "Surface_is_na", "Height_is_na",
+                               "Width_is_na", "Diam_is_na", "Width_in2"), 
+              suffix = c("", "3")) %>%
+    left_join(surface4, by = c("Surface_is_na", "Height_is_na",
+                               "Width_is_na", "Diam_is_na", "Diam_in2"), 
+              suffix = c("", "4")) %>%
+    mutate(Surface = coalesce(Surface, Surface1, Surface2, Surface3, Surface4)) %>%
+    select(-Shape2, -Surface_is_na, -Height_is_na, -Width_is_na, -Diam_is_na,
+           -Height_in2, -Width_in2, -Diam_in2, -Surface1, -Surface2, -Surface3, -Surface4)
+  
+  return(data)
+}
+```
+
+```{r clean, echo=FALSE}
+clean_general <- function(paintings_train){
+  index <- sapply(paintings_train,typeof) == "character"
+  factor_names <- names(index)[index]
+  numeric_names <- names(index)[!index]
+  paintings_train[paintings_train == "" | paintings_train == "n/a" | paintings_train == "Unknown" | paintings_train == "NA"] <- NA
+  years_df <- paintings_train %>% 
+    group_by(year) %>% 
+    summarise(avg_logprice=mean(logprice))
+  
+  # clean year
+  for (i in unique(paintings_train$year)){
+    paintings_train[,paste0("is_",i)]=ifelse(paintings_train$year==i,1L,0L)
+  }
+  
+  # clean shape
+  paintings_train <- paintings_train %>% 
+    mutate(squ_rect_oval = ifelse(grepl("squ_rect", Shape)|grepl("oval", Shape), 1L, 0L),
+           round = ifelse(grepl("ro", Shape), 1L, 0L))
+  
+  # clean material
+  paintings_train <- paintings_train %>%
+    mutate(is_bronze = ifelse(grepl("bronze", material), 1L, 0L),
+           is_wood = ifelse(grepl("bois", material), 1L, 0L),
+           is_canvas = ifelse(grepl("toile", material), 1L, 0L),
+           is_copper = ifelse(grepl("cuivre", material), 1L, 0L),
+           is_glass = ifelse(grepl("verre", material), 1L, 0L),
+           is_oil = ifelse(grepl("huile", material), 1L, 0L),
+           is_paper = ifelse(grepl("papier", material), 1L, 0L),
+           is_pastel = ifelse(grepl("pastel", material), 1L, 0L),
+           is_cardboard = ifelse(grepl("carton", material), 1L, 0L),
+           is_board = ifelse(grepl("tableau", material), 1L, 0L))
+}
+clean_author <- function(paintings_train){
+  # clean author
+  paintings_train <- paintings_train %>% 
+    mutate(is_copy = ifelse(is.na(paintings_train$authorstyle),0L,1L))
+  
+  author_style_df <- paintings_train %>%
+    mutate(price = exp(logprice)) %>%
+    group_by(authorstyle) %>%
+    summarize(total_paintings = n(),
+              log_mean_price = log(mean(price))) %>%
+    arrange(desc(total_paintings))
+  
+  temp1 <- paintings_train %>%
+    mutate(authorstandard2 = 
+             trimws(str_replace_all(authorstandard, 
+                             paste(author_style_df$authorstyle[author_style_df$authorstyle != "n/a"], collapse="|"), "")))
+  
+  author_standard2_df <- temp1 %>%
+    mutate(price = exp(logprice)) %>%
+    group_by(authorstandard2) %>%
+    summarize(total_paintings = n(),
+              log_mean_price = log(mean(price))) %>%
+    arrange(desc(total_paintings))
+  
+  ind_authors <- author_standard2_df %>%
+    separate(authorstandard2, c("Author_1", "Author_2"), sep=";") %>%
+    gather(key="Author_num", value="Author", -total_paintings, -log_mean_price) %>%
+    select(-Author_num) %>%
+    filter(!is.na(Author)) %>%
+    mutate(Author = trimws(Author)) %>%
+    group_by(Author) %>%
+    summarize(log_mean_price = log(sum(total_paintings*exp(log_mean_price))/sum(total_paintings)),
+              total_paintings = sum(total_paintings)) %>%
+    arrange(desc(total_paintings)) %>%
+    filter(total_paintings >= 10)
+  
+  paintings_train2 <- paintings_train %>%
+    mutate(authorstandard2 = 
+             trimws(str_replace_all(authorstandard, 
+                             paste(author_style_df$authorstyle[author_style_df$authorstyle != "n/a"],
+                                   collapse="|"), ""))) %>%
+    separate(authorstandard2, c("Author_1", "Author_2"), sep=";") %>%
+    mutate(Author_1 = trimws(Author_1),
+           Author_2 = trimws(Author_2))
+    
+  return(list(ind_authors= ind_authors,
+              paintings_train2 = paintings_train2))
+}
+clean <- function(df){
+  train <- clean_general(paintings_train)
+  df2 <- clean_general(df)
+  train2 <- clean_author(train)
+  ind_authors = train2$ind_authors
+  df2 <- clean_author(df2)$paintings_train2
+  
+  for(i in as.character(ind_authors$Author)){
+    df2[,paste0("is_",i)]=
+      ifelse(grepl(i, df2$Author_1, fixed=TRUE) | grepl(i,df2$Author_2, fixed=TRUE),1L,0L)
+  }
+  
+  df2 <- impute_surface_area(df2)
+  
+  df2 <- clean_names(df2)
+  df2[is.na(df2$interm),"interm"] <- "NA"
+  df2[is.na(df2$endbuyer),"endbuyer"] <- "NA"
+  df2[is.na(df2$surface),"surface"] <- ifelse(is.na(df2$shape[is.na(df2$surface)]),
+                                              median(train2$paintings_train2$Surface,na.rm=TRUE),
+                                              ifelse(df2$shape[is.na(df2$surface)]=="miniature",
+                                                     min(train2$paintings_train2$Surface[train2$paintings_train2$Surface > 0], na.rm=TRUE),
+                                                     median(train2$paintings_train2$Surface,na.rm=TRUE)))
+  index <- sapply(df2,function(x){
+    is.integer(x)|is.character(x)
+  })
+  df2[index] <- lapply(df2[index],factor)
+  return(df2)
+}
+```
+
+```{r cleaned_authors, echo=FALSE}
+
+cleaned_authors <- clean(paintings_train) %>%
+  select(is_teniers_ii_the_younger_david:is_potter_pa_paulus) %>%
+  gather(key="authorstandard", value="is_author") %>%
+  filter(is_author == 1) %>%
+  mutate(authorstandard = substring(as.character(authorstandard), 4,
+                                    nchar(as.character(authorstandard)))) %>%
+  group_by(authorstandard) %>% 
+  summarize(total=n()) %>% 
+  arrange(desc(total)) %>% 
+  slice(1:10)
+
+kable(cleaned_authors, caption= "10 most Frequent Authors, Cleaned")
+```
+
+While a lot of the most frequent are the same, we see that some, such as Jan Breughel the Elder, now appear in the data (he contributed with many others in the dataset), and others have an increased count, such as David Teniers the Younger.
+
+#### Part (c) Imputing missing data
+
+
+It is a good idea to examine which variables contain missing data, and how frequently:
+```{r NA plot,fig.height=10, fig.cap="Variables with Missing Values", echo=FALSE}
+paintings_train2 <- clean(paintings_train)
+temp <- clean_general(paintings_train) %>% 
+  select(sale:other)
+miss <- sapply(temp,function(x){
+  mean(is.na(x))
+})
+table.miss <- data.frame(cbind(Variables = names(miss) ,`Missing Rate`=round(miss,3))) %>%
+  arrange(desc(Missing.Rate)) %>% 
+  filter(Missing.Rate!=0) 
+  
+kable(table.miss, caption = "Missing Variables")
+# take out variables by looking the data description and summary
+# The following variables are taken out for at least one of the following reasons:
+# 1. redundant
+# 2. the variable has too many missing values
+# 3. not useful
+# 4. the variables are broken down into binary variables(year,authorstandard,material,Shape)
+train <- paintings_train2 %>% 
+  select(-c(sale,lot,price,count,authorstyle,winningbidder,subject,
+            other,origin_author,school_pntg,diff_origin,author,
+            winningbiddertype,type_intermed,surface_rect,surface_rnd,
+            height_in,width_in,diam_in,material_cat,mat,nfigures,
+            lands_all,lands_ment,lands_elem,year,authorstandard,material,shape)) %>% 
+  clean_names()
+```
+
+
+Since we already removed many of these variables from consideriation in the data redundancy step, we only need to impute values of `Interm`, `endbuyer`, `Surface`. 
+
+Since `Interm` and `endbuyer` are categorical, we created a separate category for the missing data.
+
+Since `Surface` is continuous, we used median imputation. We chose median imputation because the median is less sensitive to outliers than the mean, and we can see that the data is skewed (blue line represents the median, orange line represents the mean):
+
+```{r skewed_surface, echo=FALSE, message=FALSE}
+ggplot(data=paintings_train[!is.na(paintings_train$Surface),], aes(x=Surface))+
+  geom_histogram()+
+  geom_vline(xintercept = median(paintings_train$Surface, na.rm=TRUE), color="#33CCFF")+
+  geom_vline(xintercept = mean(paintings_train$Surface, na.rm=TRUE), color="#FF9933")+
+  theme_bw()+
+  ggtitle("Distribution of Surface Area")+
+  theme(plot.title = element_text(hjust=0.5))
+  
+```
+
+Additionally, we noticed that some covariates were not missing when `Surface` is missing, such as `Shape`, `Height_in`, `Width_in`, and `Diam_in`, so we conditioned our imputed values on the non-missing of these variables. For instance, observation 745 is a square rectangle painting with a height of 17 inches, so our imputed value for the surface area is 340 sq. inches, instead of the imputed 283.5 sq. inches for a square rectangle painting with no height or width filled in.
+
+#### Part (d) Variation of variables
+
+We start by examining the continuous variables:
+
+```{r eda scatter plot, echo=FALSE}
+#train <- na.omit(train)
+names.quant <- c("logprice","position","surface")
+df_quant <- train[names.quant] %>% 
+  gather(key = "quant_variable",value = "quant_value",position:surface)
+ggplot(df_quant,aes(x= quant_value,y= logprice)) +
+  geom_point()+
+  facet_wrap(~quant_variable,scales = "free") +
+  theme_bw() +
+  labs(x = "", title = "logprice vs Quantitative Predictors Scatterplots") +
+  stat_smooth(method="lm")+
+  theme(plot.title = element_text(hjust=0.5))
+```
+
+We see above that position doesn't seem to be strongly related to price, whereas there may be some relationship between surface and price.
+
+Next, we consider categorical variables. Specifically, we want to examine the sources of variation of key discrete variables (within-variable variation or between-variable variation). We look at painters who appear at least 10 times in the dataset, the material of the painting, and the year the painting was sold:
+
+```{r eda boxplot1, echo=FALSE}
+selected <- c("dealer","origin_cat","prevcoll","lrgfont","interm","endbuyer",
+              "finished","artistliving","year","is_oil","is_paper","is_copy",
+              "surface","is_crepin","is_french","is_velde_a_adriaen_van_de",
+              "is_wouwerman_philips","is_anonymous")
+author_df <-  paintings_train2 %>% 
+  select(is_teniers_ii_the_younger_david:is_potter_pa_paulus,logprice)
+author_df_long <- author_df %>% 
+  gather(key="author", value="is_author", -logprice) %>% 
+  mutate(author=substring(author, 4, nchar(author)))%>%
+  filter(is_author==1) %>% 
+  mutate(selected = ifelse(author %in% c("crepin","french","velde_a_adriaen_van_de",
+                                         "wouwerman_philips","anonymous"),"selected","not selected"))
+ggplot(data=author_df_long, aes(x=author, y=logprice, fill = factor(selected)))+
+  geom_boxplot() +
+  theme_bw() +
+  labs(x = "Authors", y = "Log Price", fill = "", title = "Log Price vs Authors")+
+  theme(axis.text.x = element_text(angle = 90))+
+  geom_hline(yintercept = median(paintings_train$logprice))+
+  scale_fill_manual(values=c("#33CCFF","#FF9933"))+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r eda boxplot2,fig.height=4, echo=FALSE}
+mat_df <- paintings_train2 %>%
+  select(is_bronze:is_board,logprice) %>% 
+  gather(key = "material",value = "is_material",-logprice) %>% 
+  mutate(material=substring(material, 4, nchar(material)))%>%
+  filter(is_material==1) %>% 
+  mutate(selected = ifelse(material %in% c("oil","paper"),"selected","not selected"))
+ggplot(data=mat_df, aes(x=material, y=logprice, fill = factor(selected)))+
+  geom_boxplot() +
+  theme_bw() +
+  labs(x = "Materials", y = "Log Price", fill = "", title = "Log Price vs Materials")+
+  geom_hline(yintercept = median(paintings_train$logprice))+
+  scale_fill_manual(values=c("#33CCFF","#FF9933"))+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r eda boxplot3,fig.height=4, echo=FALSE}
+ggplot(data=paintings_train2, aes(x=factor(year), y=logprice))+
+  geom_boxplot(fill="#FF9933") +
+  theme_bw() +
+  labs(x = "Year", y = "Log Price", title = "Log Price vs Year")+
+  geom_hline(yintercept = median(paintings_train$logprice))+
+  #scale_fill_manual(values="#FF9933")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+We can see that there exists both within-class and between-class variation for all three variables, indicating that we may want to include some of the individual levels of the variables (we highlighted the levels that we eventually use in the model in part (3) in orange), but will likely also want to control for other sources of variation.
+
+A final part we wanted to consider in sources of variation is in potential interactions. Specifically, we thought that dealers may specialize in different kinds of art, and therefore have different variation in prices for different kinds of paintings. Below, we consider the dealer's prices conditional on the origin of the work (`origin_cat`):
+
+```{r cond_plots_dealer, echo=FALSE}
+ggplot(data=paintings_train2, aes(x=origin_cat, y=logprice, fill = dealer))+
+  geom_boxplot() +
+  theme_bw() +
+  labs(x = "Origin of the Work", y = "Log Price", fill = "Dealer", title = "Log Price vs Origin and Dealer")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+We can see that dealer "R" is the exclusive dealer in Spanish paintings in this dataset, and they sold for much more than the other pieces he sold. Additionally, it looks like dealer "J" sold a small amount of highly priced works of non-Spanish, non-Dutch, non-French, and non-Italian descent, while the other dealers did not, indicating that perhaps dealer "J" had exclusive access to a specific painter/set of painters outside of western Europe.
+
+#### Part (e) AV-plots
+
+As we saw in part (e), looking at individual boxplots shows some but not all of the variation of key categorical variables. We wanted to further this analysis by robustly considering the marginal impact a variable has holding all other variables constant. Below, we plot add-variable plots of all variables we consider for our model:
+
+```{r avplot1,fig.height=4, echo=FALSE}
+formula <- as.formula(paste0("logprice ~ ", paste(paste0(selected), collapse="+")))
+par(ask = FALSE)
+avPlots(lm(formula, data=paintings_train2), layout = c(3,4),main="")
+```
+
+
+### 3. Development and assessment of an initial model (10 points)
+
+
+#### Part (a) Initial model: must include a summary table and an explanation/discussion for variable selection and overall amount of variation explained.
+Based on our EDA, we wanted to include variables that had significant slopes in the AV-plots, since once controlling for other variables, these variables still are associated with the unexplained portion of `logprice`. This led us to choose `dealer`, `origin_cat`, `prevcoll`, `lrgfont`, `interm`, `endbuyer`, `finished`, `artistliving`, `surface`, `year` (as a factor), `is_copy` (created from `authorstyle`), `is_oil` (created from `material`), `is_paper` (created from `material`), `is_crepin` (created from `authorstandard`), `is_french` (created from `authorstandard`), `is_velde_a_adriaen_van_de` (created from `authorstandard`), `is_wouwerman_philips` (created from `authorstandard`), and `is_anonymous` (created from `authorstandard`) in our initial model:
+
+```{r model1, echo=FALSE}
+model1 = lm(logprice ~ dealer+origin_cat+prevcoll+lrgfont+interm+endbuyer+
+              finished+artistliving+surface+factor(year)+is_oil+is_copy+is_paper+
+              is_crepin+is_french+is_velde_a_adriaen_van_de+
+              is_wouwerman_philips+is_anonymous,
+            data=paintings_train2)
+
+summary(model1)$call
+par(mfrow=c(2,2))
+plot(model1)
+# observations 283 and 315 have leverage one
+```
+
+We can see that the residuals are pretty consistently centered around zero across different values of the predicted `logprice`, appear generally normal, and are not especially heteroscedastic.
+
+
+```{r, echo=FALSE, message=FALSE}
+model1_conf = data.frame(names(model1$coefficients), model1$coefficients, confint(model1))
+colnames(model1_conf) = c("Coefficient", "Estimate", "2.5%", "97.5%")
+model1_conf <- model1_conf %>% 
+  arrange(desc(Estimate))
+kable(model1_conf, digits = 4,
+      caption = "Confidence interval of coefficients from initial model")
+
+kable(cbind(r.squared = summary(model1)$r.squared), caption = "R2 of the Initial Model")
+
+```
+
+We can see that the initial model explains roughly 2/3 of the variation in `logprice` for the training data, and the only variables whose CIs for the coefficient estimates cross zero are individual levels of some factor variables, indicating that all of the variables chosen in the initial model help explain what drove prices of paintings. However, in a more refined search, it may be beneficial to remove certain levels of some variables that are not appearing as valuable (perhaps we can include binary versions of the `years` variable for each year from 1764-1780 and select the significant ones instead of forcing each year to have a coefficient estimate).
+
+
+#### Part (b) Model selection: must include a discussion
+
+We first tried to modify our model by adding interactions, and thereafter used stepwise selection to further refine our model. We enumerated all interactions initially, and below provide a formula for a model with interactions that were significant enough by deviance:
+
+```{r model1 inter, echo=FALSE, message=FALSE}
+model1_inter = lm(logprice ~ (dealer+origin_cat+prevcoll+lrgfont+interm+endbuyer+
+              finished+artistliving+factor(year)+is_oil+is_copy+is_paper +surface+
+              is_crepin+is_french+is_velde_a_adriaen_van_de+
+              is_wouwerman_philips+is_anonymous)^2, data = paintings_train2)
+```
+
+```{r model1 selected interactions, echo=FALSE, message=FALSE}
+model1_modified = lm(logprice ~ dealer+origin_cat+prevcoll+lrgfont+interm+endbuyer+
+              finished+artistliving+surface+year+is_oil+is_copy+is_paper+
+              is_crepin+is_french+is_velde_a_adriaen_van_de+
+              is_wouwerman_philips+is_anonymous + dealer:origin_cat+ dealer:artistliving+
+                dealer:is_paper,
+              data = paintings_train2)
+as.formula(model1_modified)
+```
+
+As we may have expected based on our EDA, dealer interactions could be valuable in modelling art prices.
+
+Since we introduce new sources of variation, we decide to use stepwise selection with a BIC penalty to further refine the model before assessing goodness of fit and coverage. We considered both AIC and BIC models, but chose the BIC model, as we are not only trying to predict overvalued/undervalued paintings in this problem, but trying to explain what drives prices. Since BIC tries to find the true model (rather than the model that best explains the unknown), this more naturally fits our problem of explaining what drove prices.
+
+```{r model1 aic, echo=FALSE}
+model1.aic <- step(model1_modified, k = 2, trace = FALSE)
+```
+
+
+```{r aic conf, echo=FALSE}
+aic_conf <- data.frame(var = names(model1.aic$coefficients), coef = model1.aic$coefficients,
+                  lwr = confint(model1.aic)[,1], upr = confint(model1.aic)[,2],
+                  row.names = NULL)
+```
+
+
+```{r model1 bic, echo=FALSE}
+model1.bic <- step(model1_modified, k = log(nrow(paintings_train2)), trace = FALSE)
+```
+
+
+#### Part (c) Residual: must include residual plot(s) and a discussion.
+
+Below is a residual plot for our BIC-selected model:
+
+```{r bic plots, echo=FALSE}
+par(mfrow=c(2,2))
+plot(model1.bic)
+```
+
+We can see that similar to our initial model, the residuals are generally centered around zero across all values of predicted `logprice` (though even stabler for the BIC-selected model), are generally normally, and are generally homoscedastic.
+
+#### Part (d) Variables: must include table of coefficients and CI
+```{r bic tables, echo=FALSE}
+bic_conf <- data.frame(var = names(model1.bic$coefficients), coef = model1.bic$coefficients,
+                  lwr = confint(model1.bic)[,1], upr = confint(model1.bic)[,2],
+                  row.names = NULL)
+sum.model1 = summary(model1.bic)
+kable(cbind(sum.model1$coefficients,lwr=bic_conf$lwr,upr=bic_conf$upr),
+      digits=3, 
+      caption= "Best Model Summary Table With C.I. of the Coefficients")
+kable(cbind(r.squared = sum.model1$r.squared), caption = "R2 of the Best Model")
+```
+
+We see that the direction and magnitude of the variables included has not changed much compared to the initial models, though we have dropped `endbuyer`, `artistliving`, and `is_paper`. As a result, the CIs similarly only cross zero for a few levels of individual factors (specifically for `year`), and the in-sample R-squared ever-so-slightly decreased due to including fewer variables.
+
+
+```{r predict-model1, echo=FALSE}
+paintings_test <- clean(paintings_test)
+predictions = as.data.frame(
+  exp(predict(model1.bic, newdata=paintings_test, 
+              interval = "pred")))
+save(predictions, file="predict-test.Rdata")
+predictions_train = as.data.frame(
+  exp(predict(model1.bic, newdata=paintings_train2, 
+              interval = "pred")))
+save(predictions_train, file="predict-train.Rdata")
+```
+
+### 4. Summary and Conclusions (10 points)
+
+What is the (median) price for the "baseline" category if there are categorical or dummy variables in the model (add CI's)?  (be sure to include units!) Highlight important findings and potential limitations of your model.  Does it appear that interactions are important?  What are the most important variables and/or interactions?  Provide interprations of how the most important variables influence the (median) price giving a range (CI).  Correct interpretation of coefficients for the log model desirable for full points.
+
+Provide recommendations for the art historian about features or combination of features to look for to find the most valuable paintings.
+
+__Answer__:
+
+From the summary table of our best model, it seems like BIC takes out all the interactions we selected. The following is a list of included categorical variables: dealer, origin_cat, prevcoll, lrgfont, interm, finished, year, is_oil, is_copy, is_crepin, is_french, is_velde_a_adriaen_van_de, is_wouwerman_philips, is_anonymous. The baseline is the painting sold by dealer J in 1764, where the previous owner is not mentioned, the dealer did not devote an additional paragraph, an intermediary is not involved, origin of painting is Dutch/Flemish, the painting is not noted for its highly polished finishing, the material is not oil, is not a copy, and is not created by Crepin, French, Velde A Adriaen Van De, Wouwerman Philips, or anonymous author. The baseline painting price can be estimated by $exp(2.681 + 0.0003surface)$.
+
+Let us check the most important variables and their corresponding confidence intervals:
+
+```{r important variables}
+kable(bic_conf[sum.model1$coefficients[,4]<2e-16,][-1,],
+      digits = 4,
+      row.names = FALSE,
+      caption = "Most important variables")
+```
+
+From the table above, we noticed that dealer, surface, and year are the three most important variables that influence the log price of paintings. The interpretations are as following:
+
+For variable dealer, the baseline is dealer J. Keeping all other variables constant, we would expect the price of a painting sold by dealer L is exp(1.8046) =`r round(exp(1.8046),3)` times of the price of dealer J. The confidence interval is 1.4505 to 2.1587, which means we are 95% confident that dealer L's price is exp(1.4505) = `r round(exp(1.4505),3)` to exp(2.1587) = `r round(exp(2.1587),3)` times of the price of dealer J. Similarly, the price of a painting sold by dealer R is exp(1.1907) = `r round(exp(1.1907),3)` times of the price of dealer J, and we are 95% confident that dealer L's price is exp(0.9392) = `r round(exp(0.9392),3)` to exp(1.4423) = `r round(exp(1.4423),3)` times of the price of dealer J.   
+
+For surface, keeping all other variables constant, if the surface increased by 1 squared inches, we would expect the price of the painting to increase exp(0.0003)-1 = `r round((exp(0.0003)-1),5)*100`%, and we are 95% confident that the increase will be between exp(0.0002)-1 = `r round((exp(0.0002)-1),5)*100`% and exp(0.0004)-1 = `r round((exp(0.0004)-1),5)*100`%.
+
+For variable year, the baseline is year 1764. Therefore, if we keep all other variables constant, we would expect the painting price in 1767, 1774, 1776, 1777 is exp(1.4286) =`r round(exp(1.4286),3)`, exp(1.7318) =`r round(exp(1.7318),3)`, exp(1.6312) =`r round(exp(1.6312),3)`, exp(2.3804) =`r round(exp(2.3804),3)` times of the price in 1764, correspondingly. Also, we are 95% confident that the painting price in 1767, 1774, 1776, 1777 are `r round(exp(1.1562),3)` -- `r round(exp(1.7010),3)`,`r round(exp(1.3984),3)` -- `r round(exp(2.0652),3)`, `r round(exp(1.3711),3)` --  `r round(exp(1.8914),3)`, `r round(exp(2.1070),3)` -- `r round(exp(2.6539),3)` times of the painting price in 1764, correspondingly.
+
+Then, let us consider the median, the 2.5th percentile, and the 97.5th percentile for our predictions vs. the actual data:
+
+```{r median_preds, echo=FALSE}
+prediction_train = as.data.frame(
+  exp(predict(model1.bic, newdata=paintings_train2,
+              interval = "pred"))) %>%
+  mutate(price = exp(paintings_train$logprice),
+         sale = paintings_train2$sale,
+         authorstandard = paintings_train2$authorstandard,
+         resid = (price - fit))
+
+medians <- c(median(prediction_train$fit), 
+             quantile(prediction_train$fit, c(0.025, 0.975)))
+
+medians_livre <- paste(round(medians, digits=2), "livres")
+
+names(medians_livre) <- c("50th percentile", "2.5th percentile",
+                          "97.5th percentile")
+
+training_percentile <- c(median(exp(paintings_train$logprice)), 
+                         exp(quantile(paintings_train$logprice, c(0.025, 0.975))))
+
+training_livre <- paste(round(training_percentile, digits=2), "livres")
+
+livre_data <- rbind(medians_livre, training_livre)
+
+rownames(livre_data) <- c("Predicted Prices", "Actual Prices")
+
+kable(livre_data, caption="Predicted vs. Actual Quantiles")
+```
+
+We can see that the actual data has much larger values at the extreme than our models predict. It could be because sometimes, if a rich person really likes a painting, they could be a victim of the winner's curse (see: https://www.investopedia.com/terms/w/winnerscurse.asp).
+
+Additionally, the predicted median is higher than the actual median. This could be because the model was slightly influenced by the points that could have been victim to the winner's curse.
+
+Now, let's consider coverage:
+
+```{r coverage, echo=FALSE}
+
+coverage.train = mean(prediction_train$lwr<= exp(paintings_train$logprice) & prediction_train$upr>= exp(paintings_train$logprice) )
+
+kable(scales::percent(coverage.train), caption="Coverage of the training data")
+
+```
+
+We see that our model is very well calibrated on the training data, where 95% of our data fall within the 95% prediction interval. While we were off in middle and at the highly priced items in the median prediction, we see that we do a fairly good job accounting for uncertainty in the training data.
+
+While the coverage in the training data is encouraging, it is worth considering shortcomings of our model. Firstly, we only considered a subset of the painters in the model, due to having them each be binary variables and the selection methods only including a few (this is a function of some paintings having multiple painters, so there are shortcomings with encoding `authorstandard` as a multi-class categorical variable and including it once in the model). However, we may want to think of artwork prices as being part of a hierarchical model: different painters have an inherent skill level, drawn from a distribution, and each individual work of theirs has a certain quality, drawn from a distribution based on the painter's skill. For instance, an Adrien van de Velde work is on average worth `r exp(bic_conf[bic_conf$var=="is_velde_a_adriaen_van_de1", "coef"])` that of any other random painting, holding all other variables constant, with a 95% CI of (`r exp(bic_conf[bic_conf$var=="is_velde_a_adriaen_van_de1", "lwr"])`, `r exp(bic_conf[bic_conf$var=="is_velde_a_adriaen_van_de1", "upr"])`). On the other hand, if the painter is anonymous, his work is on average worth `r exp(bic_conf[bic_conf$var=="is_anonymous1", "coef"])` that of any other random painting, holding all other variables constant, with a 95% CI of (`r exp(bic_conf[bic_conf$var=="is_anonymous1", "lwr"])`, `r exp(bic_conf[bic_conf$var=="is_anonymous1", "upr"])`). Therefore, it may be worthwhile to include more levels for painters in the future, and design a model that treats the data more like a hierarchical model. Buyers may be more interested in a painting if they heard of or respected the artist, regardless of the theme of the piece, the size of it, or what materials were used. It is widely known, for instance, that the supposed last Leonardo Da Vinci painting sold for an extremely large amount of money (see: https://news.artnet.com/market/last-known-leonardo-da-vinci-painting-just-sold-1149032).
+
+It may be useful to also consider on the dealer (and maybe even the buyer!), which will be an even more complicated interaction hierarchy (and would require cleaning the buyer names as well). Once we are already trying to robustly control for one agent in the art auction process (the artist), why not account for the other agents?
+
+Finally, below we present a few undervalued pieces of artwork based on our model, followed by overvalued pieces of artwork:
+
+```{r undervalued, echo=FALSE}
+undervalued_rows <- prediction_train %>%
+  arrange(resid) %>%
+  slice(1:5) %>%
+  select(sale, authorstandard, price, fit) %>%
+  mutate(authorstandard = iconv(authorstandard, "UTF-8", "UTF-8",sub=''))
+
+colnames(undervalued_rows) <- c("Sale (Dealer+Year of Sale)", "Artist",
+                                "Actual Price", "Predicted Price")
+
+kable(undervalued_rows, caption="Undervalued Paintings")
+
+```
+
+It looks like that dealer "R" in 1776 and 1777 may have been undervaluing some of his paintings, specifically from renowned artists such as Philips Wouwerman.
+
+
+```{r overvalued, echo=FALSE}
+overvalued_rows <- prediction_train %>%
+  arrange(desc(resid)) %>%
+  slice(1:5) %>%
+  select(sale, authorstandard, price, fit) %>%
+  mutate(authorstandard = iconv(authorstandard, "UTF-8", "UTF-8",sub=''))
+
+colnames(overvalued_rows) <- c("Sale (Dealer+Year of Sale)", "Artist",
+                                "Actual Price", "Predicted Price")
+
+kable(overvalued_rows, caption="Overvalued Paintings")
+```
+
+For the overvalued paintings, this could partially be a function of our current model. We notice that none of the artists who had the most overvalued paintings were directly represented in our model, indicating that perhaps their work was very appreciated, but we did not capture it in our linear regression. It is interesting, however, that these overvalued paintings all came from the same dealer as the undervalued paintings (during a similar time period too!), which may mean he was selling to a different clientele than the rest of the dealers in a way that our best linear regression model cannot recognize.
